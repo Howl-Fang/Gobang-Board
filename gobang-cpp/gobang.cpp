@@ -11,17 +11,18 @@
 #include <atomic>
 #include <mutex>
 
-// 全局方阵大小
 static int N = 5;
-
-// 所有直线掩码（行、列、主对角线、副对角线）
 static std::vector<uint64_t> LINES;
 
-// 进度统计
-static std::atomic<uint64_t> g_scanned{0};   // 已扫描状态数
-static std::atomic<bool>     g_done{false};  // 是否全部完成
+static std::atomic<uint64_t> g_scanned{0};
+static std::atomic<uint64_t> g_valid{0};
+static std::atomic<bool>     g_done{false};
 
-// 生成 N x N 周期方阵的所有 N 连直线
+// 输出文件 + 锁
+static std::ofstream g_fout;
+static std::ofstream g_fbin;
+static std::mutex    g_out_mutex;
+
 void buildLines() {
     LINES.clear();
     for (int r = 0; r < N; ++r) {
@@ -60,20 +61,55 @@ inline bool isValid(uint64_t mask) {
     return true;
 }
 
-void worker(uint64_t start, uint64_t end, std::vector<uint64_t>& local_results) {
-    local_results.reserve((end - start) / 4);
-    const uint64_t BATCH = 4096; // 批量累加，降低原子操作开销
-    uint64_t local_count = 0;
+// 每个线程本地缓冲，攒够一批后加锁一次性写入
+void worker(uint64_t start, uint64_t end) {
+    const uint64_t BATCH_SCAN = 4096;
+    const size_t   BATCH_OUT  = 4096;   // 攒 4096 个结果再写
+
+    std::string txt_buf;   // 本地文本缓冲
+    std::vector<uint64_t> bin_buf;
+    txt_buf.reserve(BATCH_OUT * (N * N + 1));
+    bin_buf.reserve(BATCH_OUT);
+
+    uint64_t local_scan = 0;
+    uint64_t local_valid = 0;
+
     for (uint64_t mask = start; mask < end; ++mask) {
-        if (isValid(mask)) local_results.push_back(mask);
-        if (++local_count >= BATCH) {
-            g_scanned.fetch_add(local_count, std::memory_order_relaxed);
-            local_count = 0;
+        if (isValid(mask)) {
+            // 文本
+            for (int bit = 0; bit < N * N; ++bit)
+                txt_buf.push_back((mask & (1ull << bit)) ? '1' : '0');
+            txt_buf.push_back('\n');
+            // 二进制
+            bin_buf.push_back(mask);
+            ++local_valid;
+
+            if (bin_buf.size() >= BATCH_OUT) {
+                std::lock_guard<std::mutex> lk(g_out_mutex);
+                g_fout.write(txt_buf.data(), txt_buf.size());
+                g_fbin.write(reinterpret_cast<const char*>(bin_buf.data()),
+                             bin_buf.size() * sizeof(uint64_t));
+                txt_buf.clear();
+                bin_buf.clear();
+            }
+        }
+
+        if (++local_scan >= BATCH_SCAN) {
+            g_scanned.fetch_add(local_scan, std::memory_order_relaxed);
+            local_scan = 0;
         }
     }
-    if (local_count > 0) {
-        g_scanned.fetch_add(local_count, std::memory_order_relaxed);
+
+    // 刷剩余
+    if (!bin_buf.empty()) {
+        std::lock_guard<std::mutex> lk(g_out_mutex);
+        g_fout.write(txt_buf.data(), txt_buf.size());
+        g_fbin.write(reinterpret_cast<const char*>(bin_buf.data()),
+                     bin_buf.size() * sizeof(uint64_t));
     }
+    if (local_scan > 0)
+        g_scanned.fetch_add(local_scan, std::memory_order_relaxed);
+    g_valid.fetch_add(local_valid, std::memory_order_relaxed);
 }
 
 std::string maskToGridString(uint64_t mask) {
@@ -89,7 +125,6 @@ std::string maskToGridString(uint64_t mask) {
     return res;
 }
 
-// 进度条线程
 void progressLoop(uint64_t total, std::chrono::steady_clock::time_point t0) {
     using namespace std::chrono;
     const int BAR_WIDTH = 40;
@@ -107,7 +142,7 @@ void progressLoop(uint64_t total, std::chrono::steady_clock::time_point t0) {
         double dt      = duration<double>(now - last_time).count();
         uint64_t dscan = scanned - last_scanned;
 
-        double speed = (dt > 0.0) ? (double)dscan / dt : 0.0;   // 状态/秒
+        double speed = (dt > 0.0) ? (double)dscan / dt : 0.0;
         double ratio = (total > 0) ? (double)scanned / (double)total : 0.0;
         if (ratio > 1.0) ratio = 1.0;
 
@@ -115,9 +150,7 @@ void progressLoop(uint64_t total, std::chrono::steady_clock::time_point t0) {
         std::string bar(BAR_WIDTH, ' ');
         for (int i = 0; i < filled; ++i) bar[i] = '#';
 
-        double eta = (speed > 0.0)
-                     ? (double)(total - scanned) / speed
-                     : 0.0;
+        double eta = (speed > 0.0) ? (double)(total - scanned) / speed : 0.0;
 
         std::cout << "\r[进度] [" << bar << "] "
                   << std::fixed << std::setprecision(2) << (ratio * 100.0) << "% "
@@ -131,9 +164,7 @@ void progressLoop(uint64_t total, std::chrono::steady_clock::time_point t0) {
         last_scanned = scanned;
     }
 
-    // 完成时补一次 100%
     uint64_t scanned = g_scanned.load(std::memory_order_relaxed);
-    int filled = BAR_WIDTH;
     std::string bar(BAR_WIDTH, '#');
     double elapsed = duration<double>(steady_clock::now() - t0).count();
     std::cout << "\r[进度] [" << bar << "] "
@@ -169,105 +200,66 @@ int main(int argc, char** argv) {
     std::cout << "[配置] 搜索状态总数  : " << TOTAL_STATES << " (2^" << bits << ")" << std::endl;
     std::cout << "[配置] 并行计算线程数: " << num_threads << std::endl;
 
-    std::vector<std::thread> threads;
-    std::vector<std::vector<uint64_t>> thread_results(num_threads);
+    // 打开输出文件（文本 + 二进制）
+    std::string filename_txt = "valid_matrices.txt";
+    std::string filename_bin = "valid_matrices.bin";
+    g_fout.open(filename_txt, std::ios::out | std::ios::binary);
+    g_fbin.open(filename_bin, std::ios::out | std::ios::binary);
+    if (!g_fout.is_open() || !g_fbin.is_open()) {
+        std::cerr << "[错误] 无法创建输出文件\n";
+        return 1;
+    }
 
-    uint64_t chunk_size = TOTAL_STATES / num_threads;
+    g_fout << "# " << N << "x" << N << " 周期排列无" << N << "连同色矩阵统计结果\n";
+    g_fout << "# 格式说明: 每行为一个矩阵的 " << bits << " 位二进制展开（按行优先存储）\n\n";
 
     auto start_time = std::chrono::high_resolution_clock::now();
     auto progress_start = std::chrono::steady_clock::now();
 
-    // 启动进度条线程
     std::thread progress_thread(progressLoop, TOTAL_STATES, progress_start);
 
-    // 创建工作线程
+    std::vector<std::thread> threads;
+    uint64_t chunk_size = TOTAL_STATES / num_threads;
     for (unsigned int i = 0; i < num_threads; ++i) {
         uint64_t start = (uint64_t)i * chunk_size;
         uint64_t end = (i == num_threads - 1) ? TOTAL_STATES : (uint64_t)(i + 1) * chunk_size;
-        threads.emplace_back(worker, start, end, std::ref(thread_results[i]));
+        threads.emplace_back(worker, start, end);
     }
 
     for (auto& t : threads) t.join();
-
-    // 通知进度条结束
     g_done.store(true, std::memory_order_relaxed);
     progress_thread.join();
 
     auto calc_end_time = std::chrono::high_resolution_clock::now();
 
-    uint64_t total_valid = 0;
-    for (const auto& vec : thread_results) total_valid += vec.size();
+    uint64_t total_valid = g_valid.load(std::memory_order_relaxed);
 
     std::chrono::duration<double> calc_duration = calc_end_time - start_time;
+
+    // 收尾文件
+    g_fout.close();
+    g_fbin.close();
+
     std::cout << "\n[计算结果]" << std::endl;
     std::cout << " -> 满足条件的矩阵总数: " << total_valid << " 种" << std::endl;
     std::cout << " -> 占总矩阵比例      : "
               << std::fixed << std::setprecision(4)
               << (double)total_valid / (double)TOTAL_STATES * 100.0 << " %" << std::endl;
     std::cout << " -> 计算耗时          : " << calc_duration.count() << " 秒" << std::endl;
+    std::cout << " -> 文本文件: " << filename_txt << " (" 
+              << (total_valid * (bits + 1)) / (1024 * 1024) << " MB)" << std::endl;
+    std::cout << " -> 二进制文件: " << filename_bin << " ("
+              << (total_valid * 8) / (1024 * 1024) << " MB)" << std::endl;
 
-    std::string filename_txt = "valid_matrices.txt";
-    std::string filename_bin = "valid_matrices.bin";
-    std::cout << "\n[文件输出] 正在将矩阵写入文件: " << filename_txt << " ..." << std::endl;
-
-    auto io_start_time = std::chrono::high_resolution_clock::now();
-
-    std::ofstream fout(filename_txt, std::ios::out | std::ios::binary);
-    if (!fout.is_open()) {
-        std::cerr << "[错误] 无法创建文件 " << filename_txt << std::endl;
-        return 1;
-    }
-
-    fout << "# " << N << "x" << N << " 周期排列无" << N << "连同色矩阵统计结果\n";
-    fout << "# 满足条件的矩阵总数: " << total_valid << "\n";
-    fout << "# 格式说明: 每行为一个矩阵的 " << bits << " 位二进制展开（按行优先存储）\n\n";
-
-    std::string buffer;
-    buffer.reserve(1 << 20);
-    for (const auto& vec : thread_results) {
-        for (uint64_t mask : vec) {
-            for (int bit = 0; bit < bits; ++bit) {
-                buffer.push_back((mask & (1ull << bit)) ? '1' : '0');
-            }
-            buffer.push_back('\n');
-            if (buffer.size() >= (1 << 20)) {
-                fout.write(buffer.data(), buffer.size());
-                buffer.clear();
-            }
-        }
-    }
-    if (!buffer.empty()) {
-        fout.write(buffer.data(), buffer.size());
-        buffer.clear();
-    }
-    fout.close();
-
-    std::ofstream fbin(filename_bin, std::ios::out | std::ios::binary);
-    if (fbin.is_open()) {
-        for (const auto& vec : thread_results) {
-            fbin.write(reinterpret_cast<const char*>(vec.data()),
-                       vec.size() * sizeof(uint64_t));
-        }
-        fbin.close();
-    }
-
-    auto io_end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> io_duration = io_end_time - io_start_time;
-
-    std::cout << " -> 文件写入完毕，耗时: " << io_duration.count() << " 秒" << std::endl;
-    std::cout << " -> 二进制文件大小: ~" << (total_valid * 8) / (1024 * 1024)
-              << " MB (" << filename_bin << ")" << std::endl;
-
+    // 示例：从二进制文件里读回前 3 个合法矩阵展示
     std::cout << "\n[示例展示] 前3个满足条件的矩阵图案:" << std::endl;
+    std::ifstream fin(filename_bin, std::ios::in | std::ios::binary);
     int sample_count = 0;
-    for (const auto& vec : thread_results) {
-        for (uint64_t mask : vec) {
-            std::cout << "---- 示例 " << ++sample_count << " (掩码: 0x"
-                      << std::hex << mask << std::dec << ") ----\n";
-            std::cout << maskToGridString(mask);
-            if (sample_count >= 3) break;
-        }
-        if (sample_count >= 3) break;
+    uint64_t mask;
+    while (sample_count < 3 && fin.read(reinterpret_cast<char*>(&mask), sizeof(mask))) {
+        std::cout << "---- 示例 " << ++sample_count << " (掩码: 0x"
+                  << std::hex << mask << std::dec << ") ----\n";
+        std::cout << maskToGridString(mask);
     }
 
     std::cout << "\n程序运行完成！" << std::endl;
