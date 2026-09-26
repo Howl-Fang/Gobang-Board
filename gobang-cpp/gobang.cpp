@@ -8,6 +8,8 @@
 #include <iomanip>
 #include <functional>
 #include <cstdlib>
+#include <atomic>
+#include <mutex>
 
 // 全局方阵大小
 static int N = 5;
@@ -15,27 +17,23 @@ static int N = 5;
 // 所有直线掩码（行、列、主对角线、副对角线）
 static std::vector<uint64_t> LINES;
 
+// 进度统计
+static std::atomic<uint64_t> g_scanned{0};   // 已扫描状态数
+static std::atomic<bool>     g_done{false};  // 是否全部完成
+
 // 生成 N x N 周期方阵的所有 N 连直线
-// 位索引: r * N + c
 void buildLines() {
     LINES.clear();
-    const int cells = N * N;
-
-    // 行
     for (int r = 0; r < N; ++r) {
         uint64_t m = 0;
         for (int c = 0; c < N; ++c) m |= (1ull << (r * N + c));
         LINES.push_back(m);
     }
-
-    // 列
     for (int c = 0; c < N; ++c) {
         uint64_t m = 0;
         for (int r = 0; r < N; ++r) m |= (1ull << (r * N + c));
         LINES.push_back(m);
     }
-
-    // 主对角线: (r, (r + d) % N), d = 0..N-1
     for (int d = 0; d < N; ++d) {
         uint64_t m = 0;
         for (int r = 0; r < N; ++r) {
@@ -44,8 +42,6 @@ void buildLines() {
         }
         LINES.push_back(m);
     }
-
-    // 副对角线: (r, (d - r) mod N), d = 0..N-1
     for (int d = 0; d < N; ++d) {
         uint64_t m = 0;
         for (int r = 0; r < N; ++r) {
@@ -54,11 +50,8 @@ void buildLines() {
         }
         LINES.push_back(m);
     }
-
-    (void)cells;
 }
 
-// 检查某个矩阵位掩码是否满足条件：不存在全0或全1的N连线
 inline bool isValid(uint64_t mask) {
     for (uint64_t line : LINES) {
         uint64_t v = mask & line;
@@ -67,15 +60,22 @@ inline bool isValid(uint64_t mask) {
     return true;
 }
 
-// 线程工作函数
 void worker(uint64_t start, uint64_t end, std::vector<uint64_t>& local_results) {
     local_results.reserve((end - start) / 4);
+    const uint64_t BATCH = 4096; // 批量累加，降低原子操作开销
+    uint64_t local_count = 0;
     for (uint64_t mask = start; mask < end; ++mask) {
         if (isValid(mask)) local_results.push_back(mask);
+        if (++local_count >= BATCH) {
+            g_scanned.fetch_add(local_count, std::memory_order_relaxed);
+            local_count = 0;
+        }
+    }
+    if (local_count > 0) {
+        g_scanned.fetch_add(local_count, std::memory_order_relaxed);
     }
 }
 
-// 将掩码转为 N x N 文本
 std::string maskToGridString(uint64_t mask) {
     std::string res;
     res.reserve(N * (N + 1));
@@ -89,22 +89,72 @@ std::string maskToGridString(uint64_t mask) {
     return res;
 }
 
-int main(int argc, char** argv) {
-    if (argc >= 2) {
-        N = std::atoi(argv[1]);
+// 进度条线程
+void progressLoop(uint64_t total, std::chrono::steady_clock::time_point t0) {
+    using namespace std::chrono;
+    const int BAR_WIDTH = 40;
+    auto last_time = steady_clock::now();
+    uint64_t last_scanned = 0;
+
+    std::cout << "\n[进度] 开始扫描...\n";
+    while (!g_done.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(milliseconds(500));
+
+        auto now = steady_clock::now();
+        uint64_t scanned = g_scanned.load(std::memory_order_relaxed);
+
+        double elapsed = duration<double>(now - t0).count();
+        double dt      = duration<double>(now - last_time).count();
+        uint64_t dscan = scanned - last_scanned;
+
+        double speed = (dt > 0.0) ? (double)dscan / dt : 0.0;   // 状态/秒
+        double ratio = (total > 0) ? (double)scanned / (double)total : 0.0;
+        if (ratio > 1.0) ratio = 1.0;
+
+        int filled = (int)(ratio * BAR_WIDTH);
+        std::string bar(BAR_WIDTH, ' ');
+        for (int i = 0; i < filled; ++i) bar[i] = '#';
+
+        double eta = (speed > 0.0)
+                     ? (double)(total - scanned) / speed
+                     : 0.0;
+
+        std::cout << "\r[进度] [" << bar << "] "
+                  << std::fixed << std::setprecision(2) << (ratio * 100.0) << "% "
+                  << "(" << scanned << "/" << total << ") "
+                  << "速度: " << std::setprecision(2) << (speed / 1e6) << " M/s "
+                  << "已用: " << std::setprecision(1) << elapsed << "s "
+                  << "剩余: " << std::setprecision(1) << eta << "s   "
+                  << std::flush;
+
+        last_time = now;
+        last_scanned = scanned;
     }
+
+    // 完成时补一次 100%
+    uint64_t scanned = g_scanned.load(std::memory_order_relaxed);
+    int filled = BAR_WIDTH;
+    std::string bar(BAR_WIDTH, '#');
+    double elapsed = duration<double>(steady_clock::now() - t0).count();
+    std::cout << "\r[进度] [" << bar << "] "
+              << "100.00% (" << scanned << "/" << total << ") "
+              << "已用: " << std::fixed << std::setprecision(1) << elapsed << "s          "
+              << std::endl;
+}
+
+int main(int argc, char** argv) {
+    if (argc >= 2) N = std::atoi(argv[1]);
     if (N < 2 || N > 8) {
-        std::cerr << "[错误] 当前实现支持 N 在 [2, 8]（N*N 位需能放进 64 位掩码；实际可搜索范围还受 2^(N*N) 限制）\n";
+        std::cerr << "[错误] 当前实现支持 N 在 [2, 8]\n";
         return 1;
     }
 
     const int bits = N * N;
-    const uint64_t TOTAL_STATES = (bits >= 64) ? 0ull : (1ull << bits);
-
     if (bits >= 64) {
         std::cerr << "[错误] N*N 太大，无法用 64 位掩码枚举\n";
         return 1;
     }
+    const uint64_t TOTAL_STATES = (1ull << bits);
 
     buildLines();
 
@@ -125,7 +175,12 @@ int main(int argc, char** argv) {
     uint64_t chunk_size = TOTAL_STATES / num_threads;
 
     auto start_time = std::chrono::high_resolution_clock::now();
+    auto progress_start = std::chrono::steady_clock::now();
 
+    // 启动进度条线程
+    std::thread progress_thread(progressLoop, TOTAL_STATES, progress_start);
+
+    // 创建工作线程
     for (unsigned int i = 0; i < num_threads; ++i) {
         uint64_t start = (uint64_t)i * chunk_size;
         uint64_t end = (i == num_threads - 1) ? TOTAL_STATES : (uint64_t)(i + 1) * chunk_size;
@@ -133,6 +188,10 @@ int main(int argc, char** argv) {
     }
 
     for (auto& t : threads) t.join();
+
+    // 通知进度条结束
+    g_done.store(true, std::memory_order_relaxed);
+    progress_thread.join();
 
     auto calc_end_time = std::chrono::high_resolution_clock::now();
 
