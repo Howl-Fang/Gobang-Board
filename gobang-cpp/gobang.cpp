@@ -24,8 +24,7 @@ static std::atomic<bool>     g_done{false};
 
 // ============ 输出队列 ============
 struct Batch {
-    std::string           txt;   // 已经格式化的文本行
-    std::vector<uint64_t> bin;   // 原始掩码
+    std::vector<uint64_t> bin;   // 原始掩码，文本格式化交给写线程
 };
 
 static std::deque<Batch>       g_queue;
@@ -34,10 +33,12 @@ static std::condition_variable g_cv_not_empty;
 static std::condition_variable g_cv_not_full;
 static bool                    g_producers_done = false;
 
-// 队列上限（批次数）。每个 Batch 约 BATCH_OUT*(bits+1) 字节 + BATCH_OUT*8 字节
-static const size_t QUEUE_MAX  = 256;
+// 队列上限（批次数）
+static const size_t QUEUE_MAX = 1024;
 // 每个线程一次打包多少个结果
-static const size_t BATCH_OUT  = 8192;
+static const size_t BATCH_OUT = 32768;
+// 文本文件最多写多少字节（1GB）
+static const uint64_t TXT_LIMIT = 1ull << 30;
 
 // ============ 生成直线掩码 ============
 void buildLines() {
@@ -93,15 +94,27 @@ void writerLoop(const std::string& filename_txt,
     std::ofstream fbin(filename_bin, std::ios::out | std::ios::binary);
     if (!fout.is_open() || !fbin.is_open()) {
         std::cerr << "[错误] 写线程无法打开输出文件\n";
-        // 仍然要消费队列，否则生产者会一直阻塞
         std::unique_lock<std::mutex> lk(g_qmtx);
         g_cv_not_empty.wait(lk, []{ return g_producers_done && g_queue.empty(); });
         return;
     }
 
     // 大缓冲提升顺序写性能
-    std::vector<char> io_buf(1 << 20);
-    fout.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
+    std::vector<char> io_buf_bin(1 << 20);
+    fbin.rdbuf()->pubsetbuf(io_buf_bin.data(), io_buf_bin.size());
+
+    std::vector<char> io_buf_txt(1 << 20);
+    fout.rdbuf()->pubsetbuf(io_buf_txt.data(), io_buf_txt.size());
+
+    // 文本写入用的大缓冲
+    std::string txt_chunk;
+    txt_chunk.reserve(1 << 20);
+
+    uint64_t txt_written = 0;          // 已写入 txt 的字节数
+    bool     txt_limit_hit = false;    // 是否达到 1GB 上限
+    uint64_t txt_skipped = 0;          // 达到上限后跳过的结果数
+
+    const int bits = N * N;
 
     while (true) {
         Batch b;
@@ -116,13 +129,69 @@ void writerLoop(const std::string& filename_txt,
         }
         g_cv_not_full.notify_one();
 
-        if (!b.txt.empty())
-            fout.write(b.txt.data(), (std::streamsize)b.txt.size());
-        if (!b.bin.empty())
+        if (!b.bin.empty()) {
+            // 二进制：始终写
             fbin.write(reinterpret_cast<const char*>(b.bin.data()),
                        (std::streamsize)(b.bin.size() * sizeof(uint64_t)));
+
+            // 文本：达到上限后跳过
+            if (!txt_limit_hit) {
+                txt_chunk.clear();
+                for (uint64_t mask : b.bin) {
+                    for (int bit = 0; bit < bits; ++bit)
+                        txt_chunk.push_back((mask & (1ull << bit)) ? '1' : '0');
+                    txt_chunk.push_back('\n');
+
+                    // 每攒够 1MB 写一次，顺便检查上限
+                    if (txt_chunk.size() >= (1 << 20)) {
+                        uint64_t remain = TXT_LIMIT - txt_written;
+                        if (txt_chunk.size() >= remain) {
+                            fout.write(txt_chunk.data(), (std::streamsize)remain);
+                            txt_written += remain;
+                            txt_limit_hit = true;
+                            // 剩下的本批次结果计入 skipped
+                            // 已经写入 remain 字节对应完整行，不会截断行
+                            // 但为简单，跳过本批次剩余项
+                            // 估算：remain 字节对应 remain/(bits+1) 行
+                            uint64_t lines_in = remain / (bits + 1);
+                            txt_skipped += (b.bin.size() - lines_in);
+                            break;
+                        } else {
+                            fout.write(txt_chunk.data(),
+                                       (std::streamsize)txt_chunk.size());
+                            txt_written += txt_chunk.size();
+                            txt_chunk.clear();
+                        }
+                    }
+                }
+                if (!txt_limit_hit && !txt_chunk.empty()) {
+                    uint64_t remain = TXT_LIMIT - txt_written;
+                    if (txt_chunk.size() >= remain) {
+                        fout.write(txt_chunk.data(), (std::streamsize)remain);
+                        txt_written += remain;
+                        txt_limit_hit = true;
+                    } else {
+                        fout.write(txt_chunk.data(),
+                                   (std::streamsize)txt_chunk.size());
+                        txt_written += txt_chunk.size();
+                        txt_chunk.clear();
+                    }
+                }
+                if (txt_limit_hit) {
+                    // 写标注
+                    std::string note =
+                        "\n# [注意] 文本输出已达到 1GB 上限，后续满足条件的矩阵"
+                        "不再写入本文件，请以 .bin 文件为准。\n";
+                    fout.write(note.data(), (std::streamsize)note.size());
+                    fout.flush();
+                }
+            } else {
+                txt_skipped += b.bin.size();
+            }
+        }
     }
 
+    // 如果从未达到上限但队列结束，也正常关闭
     fout.flush();
     fbin.flush();
     fout.close();
@@ -131,9 +200,8 @@ void writerLoop(const std::string& filename_txt,
 
 // ============ 工作线程 ============
 void worker(uint64_t start, uint64_t end) {
-    // 线程本地缓冲区，减少入队次数与锁竞争
+    // 线程本地缓冲区
     Batch cur;
-    cur.txt.reserve(BATCH_OUT * (N * N + 1));
     cur.bin.reserve(BATCH_OUT);
 
     uint64_t local_scan  = 0;
@@ -141,16 +209,12 @@ void worker(uint64_t start, uint64_t end) {
 
     for (uint64_t mask = start; mask < end; ++mask) {
         if (isValid(mask)) {
-            for (int bit = 0; bit < N * N; ++bit)
-                cur.txt.push_back((mask & (1ull << bit)) ? '1' : '0');
-            cur.txt.push_back('\n');
             cur.bin.push_back(mask);
             ++local_valid;
 
             if (cur.bin.size() >= BATCH_OUT) {
                 pushBatch(std::move(cur));
                 cur = Batch{};
-                cur.txt.reserve(BATCH_OUT * (N * N + 1));
                 cur.bin.reserve(BATCH_OUT);
             }
         }
@@ -258,11 +322,12 @@ int main(int argc, char** argv) {
     std::cout << "[配置] 搜索状态总数  : " << TOTAL_STATES << " (2^" << bits << ")" << std::endl;
     std::cout << "[配置] 并行计算线程数: " << num_threads << std::endl;
     std::cout << "[配置] 队列上限/批次 : " << QUEUE_MAX << " x " << BATCH_OUT << std::endl;
+    std::cout << "[配置] txt 写入上限  : " << (TXT_LIMIT >> 30) << " GB（超出后只写 bin）" << std::endl;
 
     std::string filename_txt = "valid_matrices.txt";
     std::string filename_bin = "valid_matrices.bin";
 
-    // 先打开文本文件写头信息
+    // 先写文本头
     {
         std::ofstream fout(filename_txt, std::ios::out | std::ios::binary);
         fout << "# " << N << "x" << N << " 周期排列无" << N << "连同色矩阵统计结果\n";
@@ -272,13 +337,9 @@ int main(int argc, char** argv) {
     auto start_time     = std::chrono::high_resolution_clock::now();
     auto progress_start = std::chrono::steady_clock::now();
 
-    // 启动写入线程
     std::thread writer(writerLoop, filename_txt, filename_bin);
-
-    // 启动进度条线程
     std::thread progress_thread(progressLoop, TOTAL_STATES, progress_start);
 
-    // 启动工作线程
     std::vector<std::thread> threads;
     uint64_t chunk_size = TOTAL_STATES / num_threads;
     for (unsigned int i = 0; i < num_threads; ++i) {
@@ -291,7 +352,6 @@ int main(int argc, char** argv) {
 
     for (auto& t : threads) t.join();
 
-    // 通知写线程：生产者结束
     {
         std::lock_guard<std::mutex> lk(g_qmtx);
         g_producers_done = true;
@@ -313,12 +373,11 @@ int main(int argc, char** argv) {
               << std::fixed << std::setprecision(4)
               << (double)total_valid / (double)TOTAL_STATES * 100.0 << " %" << std::endl;
     std::cout << " -> 计算耗时          : " << calc_duration.count() << " 秒" << std::endl;
-    std::cout << " -> 文本文件: " << filename_txt << " (~"
-              << (total_valid * (bits + 1)) / (1024 * 1024) << " MB)" << std::endl;
+    std::cout << " -> 文本文件: " << filename_txt << " (上限 "
+              << (TXT_LIMIT >> 30) << " GB)" << std::endl;
     std::cout << " -> 二进制文件: " << filename_bin << " (~"
               << (total_valid * 8) / (1024 * 1024) << " MB)" << std::endl;
 
-    // 从二进制文件读回前 3 个示例
     std::cout << "\n[示例展示] 前3个满足条件的矩阵图案:" << std::endl;
     std::ifstream fin(filename_bin, std::ios::in | std::ios::binary);
     int sample_count = 0;
